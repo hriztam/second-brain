@@ -26,8 +26,9 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 thiserror = "1"
 anyhow = "1"
 
-# macOS system APIs (for future hotkey integration)
-# core-foundation = "0.9"
+# macOS system APIs for global hotkey detection
+core-graphics = "0.23"
+core-foundation = "0.9"
 
 [dev-dependencies]
 tokio-test = "0.4"

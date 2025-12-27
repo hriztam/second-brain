@@ -1,4 +1,7 @@
 //! Unix domain socket server for IPC
+//!
+//! Provides request-response communication and push notifications for
+//! state change events to subscribed clients.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -9,7 +12,10 @@ use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::{broadcast, RwLock};
 use tracing::{debug, error, info, warn};
 
-use super::protocol::{DaemonStatus, Mode, Request, Response};
+use crate::events::StateEvent;
+use crate::state::State;
+
+use super::protocol::{DaemonStatus, Mode, Notification, Request, Response};
 
 /// IPC Server handling client connections
 pub struct Server {
@@ -17,12 +23,16 @@ pub struct Server {
     listener: Option<UnixListener>,
     state: Arc<RwLock<ServerState>>,
     shutdown_tx: broadcast::Sender<()>,
+    /// Channel for receiving state events to broadcast to subscribed clients
+    event_rx: Option<broadcast::Receiver<StateEvent>>,
 }
 
 /// Shared server state
 struct ServerState {
     status: DaemonStatus,
     start_time: std::time::Instant,
+    /// Current internal state (for mode tracking)
+    current_state: State,
 }
 
 impl Server {
@@ -55,6 +65,7 @@ impl Server {
         let state = Arc::new(RwLock::new(ServerState {
             status: DaemonStatus::default(),
             start_time: std::time::Instant::now(),
+            current_state: State::Idle,
         }));
 
         info!(?socket_path, "IPC server listening");
@@ -64,7 +75,32 @@ impl Server {
             listener: Some(listener),
             state,
             shutdown_tx,
+            event_rx: None,
         })
+    }
+
+    /// Create a new IPC server with state event subscription
+    pub fn with_events(socket_path: &Path, event_rx: broadcast::Receiver<StateEvent>) -> Result<Self> {
+        let mut server = Self::new(socket_path)?;
+        server.event_rx = Some(event_rx);
+        Ok(server)
+    }
+
+    /// Update the current mode in server state
+    pub async fn set_state(&self, state: State) {
+        let mut server_state = self.state.write().await;
+        let old_state = server_state.current_state;
+        server_state.current_state = state;
+        server_state.status.mode = state.into();
+        server_state.status.hotkey_registered = true;
+        
+        if old_state != state {
+            info!(
+                from = ?old_state,
+                to = ?state,
+                "IPC server: mode updated"
+            );
+        }
     }
 
     /// Run the server, accepting connections
@@ -102,6 +138,7 @@ impl Server {
     /// Handle a single client connection
     async fn handle_client(mut stream: UnixStream, state: Arc<RwLock<ServerState>>) -> Result<()> {
         let mut len_buf = [0u8; 4];
+        let mut is_subscribed = false;
 
         loop {
             // Read message length (4-byte little-endian)
@@ -131,34 +168,50 @@ impl Server {
             debug!(?request, "received request");
 
             // Process request
-            let response = Self::process_request(request, &state).await;
+            let (response, subscribe) = Self::process_request(request, &state).await;
+            if subscribe {
+                is_subscribed = true;
+                debug!("client subscribed to notifications");
+            }
 
             // Send response
-            let response_bytes = serde_json::to_vec(&response)?;
-            let response_len = (response_bytes.len() as u32).to_le_bytes();
-            
-            stream.write_all(&response_len).await?;
-            stream.write_all(&response_bytes).await?;
+            Self::send_message(&mut stream, &response).await?;
         }
     }
 
+    /// Send a length-prefixed JSON message
+    async fn send_message<T: serde::Serialize>(stream: &mut UnixStream, msg: &T) -> Result<()> {
+        let msg_bytes = serde_json::to_vec(msg)?;
+        let msg_len = (msg_bytes.len() as u32).to_le_bytes();
+        
+        stream.write_all(&msg_len).await?;
+        stream.write_all(&msg_bytes).await?;
+        
+        Ok(())
+    }
+
     /// Process a request and return a response
-    async fn process_request(request: Request, state: &Arc<RwLock<ServerState>>) -> Response {
+    /// Returns (Response, should_subscribe)
+    async fn process_request(request: Request, state: &Arc<RwLock<ServerState>>) -> (Response, bool) {
         match request {
-            Request::Ping => Response::Pong,
+            Request::Ping => (Response::Pong, false),
             
             Request::GetStatus => {
                 let mut state = state.write().await;
                 state.status.uptime_secs = state.start_time.elapsed().as_secs();
-                Response::Status(state.status.clone())
+                (Response::Status(state.status.clone()), false)
             }
             
             Request::SetMode { mode } => {
                 let mut state = state.write().await;
                 let old_mode = state.status.mode;
                 state.status.mode = mode;
-                info!(?old_mode, ?mode, "mode changed");
-                Response::ModeChange { mode, active: mode != Mode::Idle }
+                info!(?old_mode, ?mode, "mode changed via IPC");
+                (Response::ModeChange { mode, active: mode != Mode::Idle }, false)
+            }
+            
+            Request::Subscribe => {
+                (Response::Subscribed, true)
             }
         }
     }

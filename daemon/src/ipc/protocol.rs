@@ -4,6 +4,9 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::events::StateEvent;
+use crate::state::State;
+
 /// Current operating mode of the daemon
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -36,6 +39,9 @@ pub enum Request {
     
     /// Ping to check connectivity
     Ping,
+    
+    /// Subscribe to state change notifications
+    Subscribe,
 }
 
 /// Responses from daemon to UI
@@ -51,8 +57,24 @@ pub enum Response {
     /// Pong response to ping
     Pong,
     
+    /// Subscription confirmed
+    Subscribed,
+    
     /// Error response
     Error { code: String, message: String },
+}
+
+/// Push notification from daemon to UI (for subscribed clients)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum Notification {
+    /// Mode has changed
+    ModeChanged {
+        mode: Mode,
+        previous: Mode,
+    },
+    /// State event occurred
+    StateEvent(StateEvent),
 }
 
 /// Full daemon status snapshot
@@ -78,6 +100,18 @@ impl Default for DaemonStatus {
             mode: Mode::default(),
             hotkey_registered: false,
             uptime_secs: 0,
+        }
+    }
+}
+
+/// Convert internal State to IPC Mode
+impl From<State> for Mode {
+    fn from(state: State) -> Self {
+        match state {
+            State::Idle => Mode::Idle,
+            State::DictationActive => Mode::Dictation,
+            State::IntelligentActive => Mode::Intelligent,
+            State::AgentActive => Mode::Agent,
         }
     }
 }
